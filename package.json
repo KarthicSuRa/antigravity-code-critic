@@ -1,0 +1,33 @@
+{
+  "name": "antigravity-code-critic",
+  "version": "1.0.0",
+  "description": "A global MCP server that acts as an adversarial code critic, verifying git changes against a stated objective.",
+  "type": "module",
+  "bin": {
+    "critic": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc && node -e \"require('fs').chmodSync('dist/index.js', '755')\"",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "code-review",
+    "ai",
+    "git",
+    "llm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3"
+  }
+}
