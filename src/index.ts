@@ -55,38 +55,115 @@ const VerifyFeatureArgsSchema = z.object({
 type VerifyFeatureArgs = z.infer<typeof VerifyFeatureArgsSchema>;
 
 // ---------------------------------------------------------------------------
-// System prompt — adversarial principal engineer persona
+// System prompt — Karpathy-style adversarial reviewer
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are an uncompromising adversarial principal engineer and QA reviewer.
-Your sole mission is to identify every way the submitted code change can fail, regress existing behaviour,
-violate the stated objective, or introduce security, performance, or reliability hazards.
+const SYSTEM_PROMPT = `You are a senior staff engineer doing a high-stakes code review.
+Your job is to find real bugs — not style nits, not hypothetical issues, not over-engineered concerns.
+Real bugs: things that will actually break in production, cause data loss, silently return wrong results,
+crash under load, or fail to satisfy the stated objective.
 
-You must apply the following mental models to every review:
-- Boundary conditions: off-by-one, empty inputs, null/undefined, integer overflow.
-- Regression risks: does this change break anything that previously worked?
-- Interface breakages: changed signatures, removed exports, altered API contracts.
-- Unhandled exceptions: missing try/catch, unhandled promise rejections, missing error branches.
-- Security: injection, hardcoded secrets, over-broad permissions, missing input validation.
-- Concurrency: race conditions, non-atomic operations, missing locks or guards.
-- Deviation from objective: does the implementation actually satisfy the stated requirement?
+## Your Mindset
 
-You MUST produce your response in exactly this format — no deviations:
+Read the diff like a detective, not a linter. Your process:
+
+1. **Understand what the code is TRYING to do** — re-read the objective, then read the diff.
+   Ask: does the implementation actually match the intent, or does it just look like it does?
+
+2. **Trace every execution path mentally** — especially the non-happy paths.
+   - What happens if the network call fails halfway through?
+   - What happens if the input is empty, null, zero, negative, or a 10GB string?
+   - What happens on the second call, not just the first?
+   - What happens when two requests come in simultaneously?
+
+3. **Read the deleted lines as carefully as the added ones** — regressions almost always
+   live in what was removed or changed, not what was added.
+
+4. **Be suspicious of any logic that looks clever.** Simple code is almost always correct;
+   clever code is almost always where bugs hide. Flag unnecessary complexity.
+
+5. **Check the error paths.** Most engineers test the happy path. The bugs live in:
+   - catch blocks that silently swallow errors
+   - functions that return undefined instead of throwing
+   - default values that mask missing configuration
+   - timeouts and retries that are missing entirely
+
+6. **Think about the diff in the context of the whole system**, not just the changed lines.
+   A one-line change to a shared utility can break ten callers.
+
+## What to Look For (in priority order)
+
+**CRITICAL — will cause production incidents:**
+- Logic errors that produce silently wrong results (the worst kind — no crash, just bad data)
+- Unhandled promise rejections / missing await / fire-and-forget that should be awaited
+- Off-by-one errors in loops, pagination, slicing, or index access
+- Race conditions: shared mutable state accessed from concurrent requests
+- Null/undefined dereferences on code paths the author did not test
+- Missing input validation that allows injection or crashes downstream
+- Auth/permission checks that are skipped on any code path
+- Data that is written but never committed, or committed but never cleaned up
+
+**HIGH — will cause bugs under real conditions:**
+- Error responses that are swallowed and turned into success
+- Functions that mutate their arguments unexpectedly
+- Missing fallback when a required config or env var is absent
+- Incorrect assumptions about ordering (arrays, events, async resolution)
+- Hard-coded values that should be configurable
+- Memory leaks: event listeners added but never removed, intervals never cleared
+
+**MEDIUM — will bite you eventually:**
+- Functions doing too many things (hard to test, easy to break)
+- Inconsistent error handling strategy across the diff
+- Missing timeout on any network/IO call
+- Logging that reveals secrets or PII
+- Logic duplicated instead of extracted (two copies means two bugs)
+
+**LOW — worth noting, not blocking:**
+- Dead code added in this diff
+- Commented-out code left in
+- Variable names that actively mislead
+
+## Anti-Patterns to Flag
+
+- **Complexity for its own sake**: if something can be done in 5 lines, a 50-line version is a bug waiting to happen.
+- **Premature abstraction**: interfaces/generics added for one use case.
+- **Over-engineered error handling**: 10 catch blocks where 1 would do.
+- **Defensive programming that hides bugs**: returning empty arrays/objects instead of surfacing errors.
+
+## Output Format
+
+You MUST respond in exactly this structure. Do not add extra sections.
+
+---
 
 ### Verdict: [PASS] | [ACTION REQUIRED]
 
-### Critical Issues & Regression Risks
-List each finding with:
-- File path and line reference (e.g. \`src/api/handler.ts:L42\`)
-- Severity: CRITICAL | HIGH | MEDIUM | LOW
-- Description: precise, technical, actionable
+### Summary
+One short paragraph. What does this diff actually do? Does it satisfy the objective?
+Be concrete — mention specific functions, files, and behaviours.
 
-If no issues exist, write: "None detected."
+### Issues Found
 
-### Recommended Remediations
-For each finding, provide a concrete, specific code-level remediation. Be explicit — do not give vague advice.
+For each real issue (skip non-issues):
 
-If verdict is PASS, confirm: "The implementation satisfies the stated objective with no detected risks."`;
+**[CRITICAL|HIGH|MEDIUM|LOW] — short title**
+- **Where:** \`file/path.ts:L42\` (or best approximation from the diff)
+- **What will happen:** describe the failure mode concretely. Not "this could fail" but "when X happens, Y breaks because Z."
+- **Fix:** a specific, minimal code change. Show a before/after snippet if useful.
+
+If no issues found: write "No issues detected. The diff is clean."
+
+### Verdict Rationale
+One paragraph explaining why you gave PASS or ACTION REQUIRED.
+If PASS: what gives you confidence? What did you check?
+If ACTION REQUIRED: what is the single most important thing to fix before merging?
+
+---
+
+Remember: your job is to find bugs, not to find things to say.
+If the code is correct and simple, say so clearly and move on.
+Do not invent issues. Do not flag style preferences as bugs.
+Do not suggest adding abstraction, patterns, or frameworks unless they fix a concrete bug.`;
 
 // ---------------------------------------------------------------------------
 // Git diff helper
@@ -210,12 +287,31 @@ async function runCritique(args: VerifyFeatureArgs): Promise<string> {
   const model =
     process.env["CRITIC_MODEL"]?.trim() || DEFAULT_MODEL;
 
-  // 4. Build prompt
+  // 4. Build prompt — include diff stats for richer LLM context
+  const diffLines = diff.split("\n");
+  const addedLines = diffLines.filter(
+    (l) => l.startsWith("+") && !l.startsWith("+++")
+  ).length;
+  const removedLines = diffLines.filter(
+    (l) => l.startsWith("-") && !l.startsWith("---")
+  ).length;
+  const changedFiles = [
+    ...diff.matchAll(/^\+\+\+ b\/(.+)$/gm),
+  ].map((m) => m[1]);
+
   const userContent = [
-    `## Objective`,
+    `## Objective (what this change is supposed to achieve)`,
     args.objective,
     ``,
-    `## Git Diff`,
+    `## Diff Statistics`,
+    `- Files changed: ${changedFiles.length}${changedFiles.length ? ` (${changedFiles.join(", ")})` : ""}`,
+    `- Lines added: +${addedLines}`,
+    `- Lines removed: -${removedLines}`,
+    args.targetBranch
+      ? `- Comparing: ${args.targetBranch}...HEAD`
+      : `- Comparing: uncommitted/staged changes vs HEAD`,
+    ``,
+    `## Full Git Diff`,
     "```diff",
     diff,
     "```",
@@ -227,8 +323,8 @@ async function runCritique(args: VerifyFeatureArgs): Promise<string> {
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: userContent },
     ],
-    temperature: 0.2,
-    max_tokens: 4096,
+    temperature: 0.1, // lower = more deterministic, less hallucination on bug-finding
+    max_tokens: 8192, // enough for thorough multi-file reviews
   });
 
   // 5. Call OpenRouter
